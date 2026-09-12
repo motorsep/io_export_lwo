@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Blender
+*.blend1
+*.blend2
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
