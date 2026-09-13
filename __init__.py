@@ -44,7 +44,7 @@
 bl_info = {
     "name": "Export idTech 4 LWO (.lwo)",
     "author": "Anthony D'Agostino (Scorpius), Gert De Roost, motorsep/Claude",
-    "version": (4, 1, 0),
+    "version": (4, 2, 0),
     "blender": (4, 4, 0),
     "location": "File > Export > idTech 4 LWO (.lwo)",
     "description": "Export static meshes as LightWave LWO2 for idTech 4 engines",
@@ -174,6 +174,32 @@ def bmesh_needs_smoothing_groups(bm):
 
 
 # =============================================================================
+# MultiUV: which UV map does a material sample?
+#
+# Blender's own answer is the UV Map node in the material's node tree, which
+# is also what makes the viewport preview the right map. Prefer the node
+# wired into an Image Texture's Vector input; otherwise any UV Map node.
+# =============================================================================
+
+def material_uv_map_name(mat):
+    if mat is None or not mat.use_nodes or mat.node_tree is None:
+        return None
+    nodes = mat.node_tree.nodes
+    for node in nodes:
+        if node.type != 'TEX_IMAGE':
+            continue
+        vec = node.inputs.get('Vector')
+        if vec is not None and vec.is_linked:
+            src = vec.links[0].from_node
+            if src.type == 'UVMAP' and src.uv_map:
+                return src.uv_map
+    for node in nodes:
+        if node.type == 'UVMAP' and node.uv_map:
+            return node.uv_map
+    return None
+
+
+# =============================================================================
 # Builder
 # =============================================================================
 
@@ -206,8 +232,7 @@ class LWOBuilder:
         self.polys = []           # (a, b, c) global point indices, LW winding
         self.poly_surf = []       # tag index per polygon
         self.poly_smgp = []       # smoothing group per polygon (0 = untagged)
-        self.uv_vmap = []         # (point, u, v)
-        self.uv_vmad = []         # (point, poly, u, v)
+        self.uv_maps = {}         # map name -> {'vmap': [(point, u, v)], 'vmad': [(point, poly, u, v)]}
         self.color_vmap = []      # (point, r, g, b, a)
         self.color_vmad = []      # (point, poly, r, g, b, a)
         self.normal_vmap = []     # (point, nx, ny, nz) LW space
@@ -313,8 +338,12 @@ class LWOBuilder:
         bm.to_mesh(mesh)
         bm.free()
 
+        # Which UV map each material slot samples (MultiUV) or the render
+        # map for everything.
+        uv_layers = self._resolve_uv_layers(obj, mesh)
+
         if capture is not None:
-            self._finish_capture(obj, mesh, capture)
+            self._finish_capture(obj, mesh, capture, uv_layers)
 
         # Bake the object transform last, on the final topology. A mirroring
         # transform flips the winding; the engine derives face normals from
@@ -330,9 +359,36 @@ class LWOBuilder:
             # bitangent sign records exactly that.
             capture['sign_flip'] = -1.0 if flip else 1.0
 
-        return mesh, smoothing, capture, flip
+        return mesh, smoothing, capture, flip, uv_layers
 
-    def _finish_capture(self, obj, mesh, capture):
+    def _resolve_uv_layers(self, obj, mesh):
+        """{material_index: uv_layer or None} for every slot used by a face.
+
+        MultiUV off: the object's render UV map for every slot. MultiUV on:
+        the map named by the material's UV Map node, falling back to the
+        render map (with a warning) when the object has no map of that name.
+        """
+        default = self._pick_uv_layer(mesh)
+        result = {}
+        for mi in set(p.material_index for p in mesh.polygons):
+            layer = default
+            if self.options['multiuv']:
+                slots = obj.material_slots
+                mat = slots[mi].material if mi < len(slots) else None
+                wanted = material_uv_map_name(mat)
+                if wanted:
+                    found = mesh.uv_layers.get(wanted)
+                    if found is None:
+                        self.warnings.append(
+                            'Material "%s" samples UV map "%s" but object "%s" has no such map; '
+                            'using "%s"' % (mat.name, wanted, obj.name,
+                                            default.name if default else 'none'))
+                    else:
+                        layer = found
+            result[mi] = layer
+        return result
+
+    def _finish_capture(self, obj, mesh, capture, uv_layers):
         """On the triangulated object-space mesh: re-apply the captured
         source normals as custom normals, compute MikkTSpace against them,
         and store per final corner: normal, tangent, bitangent sign."""
@@ -358,27 +414,40 @@ class LWOBuilder:
         mesh.normals_split_custom_set(normals)
         mesh.attributes.remove(attr)
 
-        uv_layer = self._pick_uv_layer(mesh)
-        have_tangents = uv_layer is not None
-        if have_tangents:
-            mesh.calc_tangents(uvmap=uv_layer.name)
-        else:
+        # Read the normals back from the mesh so they are exactly what
+        # MikkTSpace sees (custom normals are quantized on storage).
+        capture['normals'] = [mathutils.Vector(c.vector) for c in mesh.corner_normals]
+
+        # MikkTSpace per UV map actually sampled: each polygon's corners take
+        # the tangents computed against the map its material uses. Corners
+        # without a map stay None and get no TANG entry.
+        num_loops = len(mesh.loops)
+        tangents = [None] * num_loops
+        signs = [None] * num_loops
+        layer_names = []
+        for layer in uv_layers.values():
+            if layer is not None and layer.name not in layer_names:
+                layer_names.append(layer.name)
+        if not layer_names:
             self.warnings.append(
                 'Object "%s" has no UV map; MikkT tangents skipped, normals still exported'
                 % obj.name)
-        try:
-            # Read the normals back from the mesh so they are exactly what
-            # MikkTSpace saw (custom normals are quantized on storage).
-            capture['normals'] = [mathutils.Vector(c.vector) for c in mesh.corner_normals]
-            if have_tangents:
-                capture['tangents'] = [mathutils.Vector(l.tangent) for l in mesh.loops]
-                capture['signs'] = [l.bitangent_sign for l in mesh.loops]
-            else:
-                capture['tangents'] = None
-                capture['signs'] = None
-        finally:
-            if have_tangents:
+        for lname in layer_names:
+            mesh.calc_tangents(uvmap=lname)
+            try:
+                loops = mesh.loops
+                for poly in mesh.polygons:
+                    layer = uv_layers.get(poly.material_index)
+                    if layer is None or layer.name != lname:
+                        continue
+                    ls = poly.loop_start
+                    for li in range(ls, ls + poly.loop_total):
+                        tangents[li] = mathutils.Vector(loops[li].tangent)
+                        signs[li] = loops[li].bitangent_sign
+            finally:
                 mesh.free_tangents()
+        capture['tangents'] = tangents
+        capture['signs'] = signs
 
     # -------------------------------------------------------------------------
     # Accumulation
@@ -420,13 +489,13 @@ class LWOBuilder:
         return attrs.active_color or attrs[0]
 
     def _append_object(self, obj):
-        mesh, smoothing, capture, flip = self._prepare_mesh(obj)
+        mesh, smoothing, capture, flip, uv_layers = self._prepare_mesh(obj)
         try:
-            self._append_mesh(obj, mesh, smoothing, capture, flip)
+            self._append_mesh(obj, mesh, smoothing, capture, flip, uv_layers)
         finally:
             bpy.data.meshes.remove(mesh)
 
-    def _append_mesh(self, obj, mesh, smoothing, capture, flip):
+    def _append_mesh(self, obj, mesh, smoothing, capture, flip, uv_layers):
         base_point = len(self.points)
         base_poly = len(self.polys)
 
@@ -457,31 +526,8 @@ class LWOBuilder:
             group = smoothing.get(poly.index, 0) if smoothing else 0
             self.poly_smgp.append(group)
 
-        # UVs: the vertex's first corner sets the VMAP value; corners that
-        # disagree (seams) get a per-polygon VMAD override, which the engine
-        # applies after the VMAP value.
-        uv_layer = self._pick_uv_layer(mesh)
-        if uv_layer is None:
-            self.warnings.append(
-                'Object "%s" has no UV map; the engine will warn about missing uv data'
-                % obj.name)
-        else:
-            if self.uv_name is None:
-                self.uv_name = uv_layer.name
-            uv_data = uv_layer.data
-            base_uv = {}
-            eps = self.UV_EPS
-            for poly in mesh.polygons:
-                ls = poly.loop_start
-                for li in range(ls, ls + poly.loop_total):
-                    vi = loops[li].vertex_index
-                    u, v = uv_data[li].uv
-                    known = base_uv.get(vi)
-                    if known is None:
-                        base_uv[vi] = (u, v)
-                        self.uv_vmap.append((vi + base_point, u, v))
-                    elif abs(known[0] - u) > eps or abs(known[1] - v) > eps:
-                        self.uv_vmad.append((vi + base_point, poly.index + base_poly, u, v))
+        # UVs, one map per material (MultiUV) or the render map for all.
+        self._append_uvs(obj, mesh, uv_layers, base_point, base_poly)
 
         # Vertex colors: same VMAP + VMAD split, from the render color attribute.
         if self.options['vertex_colors']:
@@ -529,9 +575,10 @@ class LWOBuilder:
                 elif max(abs(known[k] - rec[k]) for k in range(3)) > eps:
                     self.normal_vmad.append((vi + base_point, poly.index + base_poly) + rec)
 
-                if src_tangents is None:
+                t_src = src_tangents[src]
+                if t_src is None:
                     continue
-                t = t_xform @ src_tangents[src]
+                t = t_xform @ t_src
                 # Re-orthogonalize against the transformed normal so the
                 # engine's cross(normal, tangent) bitangent stays exact.
                 t = (t - n * n.dot(t)).normalized()
@@ -542,6 +589,68 @@ class LWOBuilder:
                     self.tangent_vmap.append((vi + base_point,) + rec)
                 elif max(abs(known[k] - rec[k]) for k in range(4)) > eps:
                     self.tangent_vmad.append((vi + base_point, poly.index + base_poly) + rec)
+
+    def _append_uvs(self, obj, mesh, uv_layers, base_point, base_poly):
+        """The vertex's first corner sets the VMAP value; corners that
+        disagree (seams) get a per-polygon VMAD override, which the engine
+        applies after the VMAP value.
+
+        With MultiUV, polygons of different materials can sample different
+        maps, written as separate sparse TXUV maps (the LightWave way). The
+        engine concatenates all TXUV maps and keeps, per corner, the point
+        entry then any polygon entry, so a vertex on the border between two
+        maps must not carry a point entry in either: it gets polygon
+        entries only, one per corner in the map that corner belongs to.
+        """
+        loops = mesh.loops
+        eps = self.UV_EPS
+        multi = self.options['multiuv']
+
+        per_map = {}          # key -> {'base': {vi: (u, v)}, 'corners': [(vi, pi, u, v)]}
+        missing = False
+        for poly in mesh.polygons:
+            layer = uv_layers.get(poly.material_index)
+            if layer is None:
+                missing = True
+                continue
+            if multi:
+                key = layer.name
+            else:
+                if self.uv_name is None:
+                    self.uv_name = layer.name
+                key = self.uv_name
+            entry = per_map.setdefault(key, {'base': {}, 'corners': []})
+            data = layer.data
+            ls = poly.loop_start
+            for li in range(ls, ls + poly.loop_total):
+                vi = loops[li].vertex_index
+                u, v = data[li].uv
+                entry['corners'].append((vi, poly.index, u, v))
+                entry['base'].setdefault(vi, (u, v))
+
+        if missing:
+            self.warnings.append(
+                'Object "%s" has faces without a UV map; the engine will warn about missing uv data'
+                % obj.name)
+
+        vertex_maps = {}
+        for key, entry in per_map.items():
+            for vi in entry['base']:
+                vertex_maps.setdefault(vi, set()).add(key)
+
+        for key, entry in per_map.items():
+            store = self.uv_maps.setdefault(key, {'vmap': [], 'vmad': []})
+            base = entry['base']
+            for vi, (u, v) in base.items():
+                if len(vertex_maps[vi]) == 1:
+                    store['vmap'].append((vi + base_point, u, v))
+            for vi, pi, u, v in entry['corners']:
+                if len(vertex_maps[vi]) > 1:
+                    store['vmad'].append((vi + base_point, pi + base_poly, u, v))
+                    continue
+                bu, bv = base[vi]
+                if abs(bu - u) > eps or abs(bv - v) > eps:
+                    store['vmad'].append((vi + base_point, pi + base_poly, u, v))
 
     def _append_colors(self, mesh, attr, base_point, base_poly):
         srgb = self.options['color_space'] == 'SRGB'
@@ -628,8 +737,9 @@ class LWOBuilder:
             '>6f', min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))))
 
         # Per-point maps
-        if self.uv_vmap:
-            body.write(vmap_chunk(b'VMAP', b'TXUV', 2, self.uv_name, self.uv_vmap))
+        for uv_name, uv_map in self.uv_maps.items():
+            if uv_map['vmap']:
+                body.write(vmap_chunk(b'VMAP', b'TXUV', 2, uv_name, uv_map['vmap']))
         if self.color_vmap:
             body.write(vmap_chunk(b'VMAP', b'RGBA', 4, self.color_name, self.color_vmap))
         if self.normal_vmap:
@@ -648,8 +758,9 @@ class LWOBuilder:
         body.write(chunk(b'POLS', pols.getvalue()))
 
         # Per-polygon-vertex overrides (must follow POLS)
-        if self.uv_vmad:
-            body.write(vmap_chunk(b'VMAD', b'TXUV', 2, self.uv_name, self.uv_vmad))
+        for uv_name, uv_map in self.uv_maps.items():
+            if uv_map['vmad']:
+                body.write(vmap_chunk(b'VMAD', b'TXUV', 2, uv_name, uv_map['vmad']))
         if self.color_vmad:
             body.write(vmap_chunk(b'VMAD', b'RGBA', 4, self.color_name, self.color_vmad))
         if self.normal_vmad:
@@ -691,8 +802,8 @@ class LWOBuilder:
         return b'FORM' + struct.pack('>I', len(data) + 4) + b'LWO2' + data
 
     def summary(self):
-        s = '%d points, %d triangles, %d surfaces' % (
-            len(self.points), len(self.polys), len(self.surface_has_smooth))
+        s = '%d points, %d triangles, %d surfaces, %d UV map(s)' % (
+            len(self.points), len(self.polys), len(self.surface_has_smooth), len(self.uv_maps))
         if self.normal_vmap:
             s += ', MikkT: %d normals, %d tangents' % (
                 len(self.normal_vmap) + len(self.normal_vmad),
@@ -761,6 +872,15 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
                     "tangents (TANG) vertex maps. Only the Fall of Phaeton engine "
                     "reads them; stock idTech 4 ignores the extra maps and shades "
                     "from the smoothing data as usual, so the file stays classic-compatible",
+        default=False,
+    )
+
+    option_multiuv: BoolProperty(
+        name="MultiUV (per-material UV maps)",
+        description="Each material samples the UV map named by the UV Map node in "
+                    "its node tree; polygons are written with that map, as separate "
+                    "sparse TXUV maps like LightWave does. Materials without a UV Map "
+                    "node use the object's render UV map. See MULTIUV.md",
         default=False,
     )
 
@@ -838,6 +958,7 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
         box.prop(self, 'option_smoothing_groups')
         box.prop(self, 'option_smoothing_angle')
         box.prop(self, 'option_mikkt')
+        box.prop(self, 'option_multiuv')
 
         box = layout.box()
         box.label(text='Vertex Colors:')
@@ -870,6 +991,7 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
             'smoothing_groups': self.option_smoothing_groups,
             'smoothing_angle': self.option_smoothing_angle,
             'mikkt': self.option_mikkt,
+            'multiuv': self.option_multiuv,
             'vertex_colors': self.option_vertex_colors,
             'color_space': self.option_color_space,
             'apply_scale': self.option_apply_scale,
