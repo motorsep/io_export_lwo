@@ -44,7 +44,7 @@
 bl_info = {
     "name": "Export idTech 4 LWO (.lwo)",
     "author": "Anthony D'Agostino (Scorpius), Gert De Roost, motorsep/Claude",
-    "version": (4, 2, 0),
+    "version": (4, 3, 0),
     "blender": (4, 4, 0),
     "location": "File > Export > idTech 4 LWO (.lwo)",
     "description": "Export static meshes as LightWave LWO2 for idTech 4 engines",
@@ -433,7 +433,21 @@ class LWOBuilder:
                 'Object "%s" has no UV map; MikkT tangents skipped, normals still exported'
                 % obj.name)
         for lname in layer_names:
-            mesh.calc_tangents(uvmap=lname)
+            # Precomputed frames win: a mesh that is one piece of a larger
+            # continuous surface (terrain chunks) carries MikkT computed on
+            # the WHOLE surface in corner attributes mikkt_tangent.<uv> /
+            # mikkt_sign.<uv>. Recomputing here would average each border
+            # vertex over this piece's faces only and the neighbouring piece
+            # would disagree, showing a seam under normal mapping.
+            pre_t = mesh.attributes.get('mikkt_tangent.' + lname)
+            pre_s = mesh.attributes.get('mikkt_sign.' + lname)
+            precomputed = (pre_t is not None and pre_s is not None
+                           and pre_t.domain == 'CORNER' and pre_s.domain == 'CORNER'
+                           and pre_t.data_type == 'FLOAT_VECTOR' and pre_s.data_type == 'FLOAT')
+            if precomputed:
+                print('LWO Export: "%s" uses precomputed MikkT frames for UV map "%s"' % (obj.name, lname))
+            else:
+                mesh.calc_tangents(uvmap=lname)
             try:
                 loops = mesh.loops
                 for poly in mesh.polygons:
@@ -442,10 +456,15 @@ class LWOBuilder:
                         continue
                     ls = poly.loop_start
                     for li in range(ls, ls + poly.loop_total):
-                        tangents[li] = mathutils.Vector(loops[li].tangent)
-                        signs[li] = loops[li].bitangent_sign
+                        if precomputed:
+                            tangents[li] = mathutils.Vector(pre_t.data[li].vector)
+                            signs[li] = pre_s.data[li].value
+                        else:
+                            tangents[li] = mathutils.Vector(loops[li].tangent)
+                            signs[li] = loops[li].bitangent_sign
             finally:
-                mesh.free_tangents()
+                if not precomputed:
+                    mesh.free_tangents()
         capture['tangents'] = tangents
         capture['signs'] = signs
 
@@ -582,7 +601,15 @@ class LWOBuilder:
                 # Re-orthogonalize against the transformed normal so the
                 # engine's cross(normal, tangent) bitangent stays exact.
                 t = (t - n * n.dot(t)).normalized()
-                rec = (t.x, t.z, t.y, src_signs[src] * sign_flip)
+                # The engine's LWO loader inverts t on load (1 - v for every
+                # TXUV value, Model.cpp), which mirrors texture space and with
+                # it the bitangent. MikkT was computed in Blender's unflipped
+                # UV space, so the handedness must be negated to describe the
+                # same frame in the engine's space (the y/z axis swap is
+                # undone symmetrically by the loader and does not change it).
+                # Same fix as the ASE exporter 3.7.1, where it was verified
+                # numerically against R_DeriveTangents.
+                rec = (t.x, t.z, t.y, -src_signs[src] * sign_flip)
                 known = base_tangent.get(vi)
                 if known is None:
                     base_tangent[vi] = rec
