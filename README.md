@@ -38,6 +38,37 @@ Select the mesh objects, `File > Export > idTech 4 LWO (.lwo)`.
 | Apply Scale / Rotation / Location | on | Bake the object's world transform. A mirrored (negative-scale) transform flips the winding back automatically. |
 | Scale | 1.0 | Uniform multiplier on positions. |
 | Batch Export | off | One `.lwo` per object next to the chosen file. |
+| Export Animation Frames | off | One `.lwo` per frame of the chosen Action(s), see below. |
+
+## Animation frames (mesh flipbooks)
+
+With **Export Animation Frames** on, the exporter steps the scene through the
+frames of each chosen Action and writes one file per frame next to the chosen
+file: `<name>_00001.lwo`, `<name>_00002.lwo`, ... numbered contiguously from 1,
+so a Fall of Phaeton `.flipdef` can reference the whole run as
+`sourceRangeStart` / `sourceRangeEnd`. `<name>` is the object name (one
+selected object, or Batch Export), otherwise the chosen file name.
+
+Keyframed transforms, shape keys and armature deformation are all taken from
+the evaluated frame, so the same export works for any of them (Apply
+Modifiers must stay on for shape keys and armatures). The panel lists every
+Action in the file with Select / Deselect / Invert; **Only selected from list**
+restricts the export to the ticked ones, otherwise all are exported. An
+Action is applied to whatever it can drive among the selected objects: object
+transform curves to the objects, shape key curves to their shape key blocks,
+pose curves to the armature of their Armature modifier. Actions that drive
+nothing in the selection are skipped with a warning.
+
+* **Only keyed frames**: write only the frames that carry a keyframe (e.g.
+  three key poses instead of the interpolated run), still numbered 1..N.
+* **Action name in file names**: `<name>_<action>_00001.lwo`. Forced on when
+  several Actions are exported, so their frames do not overwrite each other.
+
+For `linear` interpolation in the engine every frame must be the same mesh
+with only positions changed: do not add or remove geometry between frames,
+keep all frames shade-smooth, and triangulate the base mesh before making
+the frames. The active action, slot and current frame are restored after the
+export.
 
 ## What is written
 

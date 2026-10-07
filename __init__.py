@@ -40,11 +40,19 @@
 #       normals (NORM, dim 3) and MikkTSpace tangents (TANG, dim 4: xyz +
 #       bitangent sign) as VMAP/VMAD pairs. Stock idTech 4 parses unknown
 #       vertex maps and ignores them, so the file stays loadable there.
+#   4.4.0 (2026-10) motorsep/Claude - "Export animation frames": one LWO per
+#       frame of the chosen Action(s), for the Fall of Phaeton mesh flipbook
+#       compiler (buildMeshFlipbook). Keyframed transforms, shape keys and
+#       armature deformation all come through the evaluated depsgraph, so the
+#       same frame files work for any of them. Files are named
+#       <object>_<00001>.lwo (optionally <object>_<action>_<00001>.lwo); the
+#       frames are numbered contiguously so a .flipdef can name them as a
+#       sourceRangeStart / sourceRangeEnd pair.
 
 bl_info = {
     "name": "Export idTech 4 LWO (.lwo)",
     "author": "Anthony D'Agostino (Scorpius), Gert De Roost, motorsep/Claude",
-    "version": (4, 3, 0),
+    "version": (4, 4, 0),
     "blender": (4, 4, 0),
     "location": "File > Export > idTech 4 LWO (.lwo)",
     "description": "Export static meshes as LightWave LWO2 for idTech 4 engines",
@@ -64,7 +72,8 @@ import bpy
 import bmesh
 import mathutils
 from bpy_extras.io_utils import ExportHelper
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty,
+                       IntProperty, StringProperty)
 
 
 # =============================================================================
@@ -839,6 +848,170 @@ class LWOBuilder:
 
 
 # =============================================================================
+# Animation frames
+#
+# One LWO per frame of an Action. Nothing special is done for shape keys,
+# armatures or keyed transforms: the scene is stepped with frame_set and the
+# builder reads the evaluated depsgraph as it always does, so whatever
+# Blender shows on that frame is what gets written. The only state touched is
+# the active action/slot of the IDs the action drives, and the current frame;
+# both are restored afterwards.
+#
+# Slotted actions (Blender 4.4+): Action.fcurves is gone in 5.2, curves live
+# in layers -> strips -> channelbags, and an action evaluates to NOTHING on an
+# ID until a slot is bound to it. Same handling as the MD5 exporter.
+# =============================================================================
+
+def iter_action_fcurves(action):
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is not None:
+        for fc in fcurves:
+            yield fc
+        return
+    for layer in getattr(action, "layers", ()):
+        for strip in layer.strips:
+            channelbags = getattr(strip, "channelbags", None)
+            if channelbags is None:
+                continue
+            for bag in channelbags:
+                for fc in bag.fcurves:
+                    yield fc
+
+
+def action_target_kinds(action):
+    """What the action drives: a set of 'POSE' (armature pose curves), 'KEY'
+    (shape key values) and 'OBJECT' (object transforms / properties). A
+    slotted action can hold several at once (Blender 5 files an object's
+    shape key keys and its own keys in one action with two slots)."""
+    kinds = set()
+    slots = getattr(action, "slots", None)
+    if slots:
+        for s in slots:
+            t = getattr(s, "target_id_type", 'OBJECT')
+            if t == 'KEY':
+                kinds.add('KEY')
+            elif t == 'OBJECT':
+                kinds.add('OBJECT')
+    for fc in iter_action_fcurves(action):
+        if fc.data_path.startswith("pose.bones"):
+            kinds.discard('OBJECT')
+            kinds.add('POSE')
+        elif fc.data_path.startswith("key_blocks"):
+            kinds.add('KEY')
+        elif not slots:
+            kinds.add('OBJECT')
+    if not kinds:
+        kinds.add('OBJECT')
+    return kinds
+
+
+def action_frame_range(action):
+    start, end = action.frame_range
+    return int(math.floor(start)), int(math.ceil(end))
+
+
+def action_keyed_frames(action):
+    """Sorted distinct frames that carry a key on any F-Curve of the action."""
+    frames = set()
+    for fc in iter_action_fcurves(action):
+        for kp in fc.keyframe_points:
+            frames.add(int(round(kp.co[0])))
+    return sorted(frames)
+
+
+def assign_action(anim_data, action, want_type, slot=None):
+    """Bind an action (and a slot of the wanted target type) to an AnimData."""
+    anim_data.action = action
+    if action is None or not hasattr(anim_data, "action_slot"):
+        return
+    if slot is not None:
+        try:
+            anim_data.action_slot = slot
+            return
+        except Exception as e:
+            print("LWO Export: could not restore action slot: %s" % e)
+    if anim_data.action_slot is not None:
+        return
+    slots = getattr(action, "slots", None)
+    if not slots:
+        return
+    wanted = [s for s in slots if getattr(s, "target_id_type", 'OBJECT') == want_type]
+    chosen = wanted[0] if wanted else slots[0]
+    try:
+        anim_data.action_slot = chosen
+    except Exception as e:
+        print("LWO Export: WARNING could not bind slot for '%s': %s" % (action.name, e))
+
+
+def action_targets(action, mesh_objects):
+    """[(id, slot_type)] for everything in the selection this action can
+    drive; slot_type is what assign_action should bind ('OBJECT' or 'KEY')."""
+    kinds = action_target_kinds(action)
+    targets = []
+
+    def add(ident, slot_type):
+        if all(t[0] != ident for t in targets):
+            targets.append((ident, slot_type))
+
+    for obj in mesh_objects:
+        if 'KEY' in kinds and obj.data.shape_keys is not None:
+            add(obj.data.shape_keys, 'KEY')
+        if 'POSE' in kinds:
+            for mod in obj.modifiers:
+                if mod.type == 'ARMATURE' and mod.object is not None:
+                    add(mod.object, 'OBJECT')
+        if 'OBJECT' in kinds:
+            add(obj, 'OBJECT')
+    return kinds, targets
+
+
+def safe_name(name):
+    out = []
+    for ch in name:
+        out.append(ch if (ch.isalnum() or ch in '-_') else '_')
+    return ''.join(out)
+
+
+class LWOActionItem(bpy.types.PropertyGroup):
+    export_action: BoolProperty(default=False, name="")
+
+
+class LWO_UL_ActionsList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon,
+                  active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.prop(item, "export_action", text=item.name)
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.prop(item, "export_action", text="")
+
+
+class EXPORT_OT_idtech_lwo_select_actions(bpy.types.Operator):
+    """(De-)Select all actions or invert the selection for export"""
+    bl_idname = "export_scene.idtech_lwo_select_actions"
+    bl_label = "Select actions"
+
+    action: EnumProperty(
+        items=(("SELECT", "Select all", ""),
+               ("DESELECT", "Deselect all", ""),
+               ("INVERT", "Invert selection", "")),
+        default="SELECT")
+
+    def execute(self, context):
+        op = context.active_operator
+        if op is None or not hasattr(op, "anim_actions"):
+            return {'CANCELLED'}
+        for a in op.anim_actions:
+            if self.action == "DESELECT":
+                a.export_action = False
+            elif self.action == "INVERT":
+                a.export_action = not a.export_action
+            else:
+                a.export_action = True
+        return {'FINISHED'}
+
+
+# =============================================================================
 # Operator
 # =============================================================================
 
@@ -975,6 +1148,41 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    # -- Animation frames --
+
+    option_anim_frames: BoolProperty(
+        name="Export Animation Frames",
+        description="Instead of one file, write one .lwo per frame of the chosen "
+                    "Action(s): <name>_00001.lwo, <name>_00002.lwo ... next to the "
+                    "chosen file. Keyframed transforms, shape keys and armature "
+                    "deformation are all taken from the evaluated frame. Feeds the "
+                    "Fall of Phaeton mesh flipbook compiler (buildMeshFlipbook)",
+        default=False,
+    )
+
+    option_anim_sel_only: BoolProperty(
+        name="Only selected from list",
+        description="Export only the ticked Actions. Off: every listed Action",
+        default=False,
+    )
+
+    option_anim_keyed_only: BoolProperty(
+        name="Only keyed frames",
+        description="Write only the frames that carry a keyframe on the Action "
+                    "(still numbered contiguously). Off: every frame of the "
+                    "Action's range, interpolated frames included",
+        default=False,
+    )
+
+    option_anim_action_prefix: BoolProperty(
+        name="Action name in file names",
+        description="<name>_<action>_00001.lwo instead of <name>_00001.lwo",
+        default=False,
+    )
+
+    anim_actions: CollectionProperty(type=LWOActionItem)
+    anim_actions_idx: IntProperty()
+
     def draw(self, context):
         layout = self.layout
 
@@ -1005,9 +1213,47 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
         box.prop(self, 'option_scale')
         box.prop(self, 'option_batch')
 
+        box = layout.box()
+        box.prop(self, 'option_anim_frames')
+        if self.option_anim_frames:
+            count = len(self.anim_actions)
+            if count == 0:
+                box.label(text='No Actions in this file', icon='ERROR')
+            else:
+                if self.option_anim_sel_only:
+                    chosen = len([a for a in self.anim_actions if a.export_action])
+                    box.label(text='Export actions: %d' % chosen)
+                else:
+                    box.label(text='Export actions: %d (all)' % count)
+                box.prop(self, 'option_anim_sel_only')
+                col = box.column()
+                col.active = self.option_anim_sel_only
+                col.template_list("LWO_UL_ActionsList", "",
+                                  self, "anim_actions",
+                                  self, "anim_actions_idx",
+                                  rows=min(count, 8))
+                sub = col.row(align=True)
+                sub.operator(EXPORT_OT_idtech_lwo_select_actions.bl_idname,
+                             text="Select").action = "SELECT"
+                sub.operator(EXPORT_OT_idtech_lwo_select_actions.bl_idname,
+                             text="Deselect").action = "DESELECT"
+                sub.operator(EXPORT_OT_idtech_lwo_select_actions.bl_idname,
+                             text="Invert").action = "INVERT"
+                box.prop(self, 'option_anim_keyed_only')
+                box.prop(self, 'option_anim_action_prefix')
+                if not self.option_apply_modifiers:
+                    box.label(text='Shape keys / armatures need Apply Modifiers', icon='ERROR')
+
     @classmethod
     def poll(cls, context):
         return any(obj.type == 'MESH' for obj in context.selected_objects)
+
+    def invoke(self, context, event):
+        self.anim_actions.clear()
+        for action in bpy.data.actions:
+            item = self.anim_actions.add()
+            item.name = action.name
+        return super().invoke(context, event)
 
     def execute(self, context):
         start = time.perf_counter()
@@ -1036,7 +1282,9 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
         builder = LWOBuilder(context, options)
         written = []
         try:
-            if self.option_batch:
+            if self.option_anim_frames:
+                written = self._export_animation(context, builder, mesh_objects)
+            elif self.option_batch:
                 base_dir = os.path.dirname(self.filepath)
                 for obj in mesh_objects:
                     stem = obj.name.replace('.', '_')
@@ -1070,6 +1318,124 @@ class EXPORT_OT_idtech_lwo(bpy.types.Operator, ExportHelper):
         except IOError as e:
             raise RuntimeError('Could not write file: %s\n%s' % (path, e))
 
+    # -------------------------------------------------------------------------
+    # Animation frames
+    # -------------------------------------------------------------------------
+
+    def _chosen_actions(self):
+        """Actions from the list (populated on invoke); from a script the list
+        is empty and every action in the file is a candidate."""
+        names = [a.name for a in self.anim_actions
+                 if a.export_action or not self.option_anim_sel_only]
+        if not self.anim_actions:
+            names = [a.name for a in bpy.data.actions]
+        actions = []
+        for name in names:
+            action = bpy.data.actions.get(name)
+            if action is not None and action not in actions:
+                actions.append(action)
+        return actions
+
+    def _export_animation(self, context, builder, mesh_objects):
+        scene = context.scene
+        base_dir = os.path.dirname(self.filepath)
+        actions = self._chosen_actions()
+        if not actions:
+            raise RuntimeError('No Actions to export')
+        if not self.option_apply_modifiers:
+            builder.warnings.append(
+                'Apply Modifiers is off: shape keys and armature deformation are not '
+                'evaluated, only keyed object transforms will animate')
+
+        # which files: one series per object (Batch) or one merged series
+        if self.option_batch:
+            series = [([obj], safe_name(obj.name)) for obj in mesh_objects]
+        elif len(mesh_objects) == 1:
+            series = [(mesh_objects, safe_name(mesh_objects[0].name))]
+        else:
+            series = [(mesh_objects, os.path.splitext(os.path.basename(self.filepath))[0])]
+
+        saved_frame = scene.frame_current
+        saved = {}       # id pointer -> (id, had_anim_data, action, slot)
+        written = []
+
+        # two actions into one series would overwrite each other's files
+        use_tag = self.option_anim_action_prefix
+        if len(actions) > 1 and not use_tag:
+            use_tag = True
+            builder.warnings.append(
+                'Several Actions chosen: the action name is added to the file names '
+                'so their frames do not overwrite each other')
+
+        def remember(ident):
+            if ident.as_pointer() in saved:
+                return
+            ad = ident.animation_data
+            if ad is None:
+                saved[ident.as_pointer()] = (ident, False, None, None)
+            else:
+                saved[ident.as_pointer()] = (ident, True, ad.action, getattr(ad, "action_slot", None))
+
+        try:
+            for action in actions:
+                kinds, targets = action_targets(action, mesh_objects)
+                if not targets:
+                    builder.warnings.append(
+                        'Action "%s" drives %s but nothing in the selection has it; skipped'
+                        % (action.name, ', '.join(sorted(
+                            {'KEY': 'shape keys', 'POSE': 'an armature', 'OBJECT': 'object transforms'}[k]
+                            for k in kinds))))
+                    continue
+
+                # unbind every other target first so an action from a previous
+                # pass does not keep animating alongside this one
+                for ident, _t in targets:
+                    remember(ident)
+                target_ids = [t[0] for t in targets]
+                for ptr, (ident, had, _a, _s) in saved.items():
+                    ad = ident.animation_data
+                    if ident in target_ids:
+                        if ad is None:
+                            ad = ident.animation_data_create()
+                        want = next(t[1] for t in targets if t[0] == ident)
+                        assign_action(ad, action, want)
+                    elif ad is not None:
+                        ad.action = None
+
+                start, end = action_frame_range(action)
+                if self.option_anim_keyed_only:
+                    frames = [f for f in action_keyed_frames(action) if start <= f <= end]
+                    if not frames:
+                        builder.warnings.append(
+                            'Action "%s" has no keyframes in its range; exporting every frame' % action.name)
+                        frames = list(range(start, end + 1))
+                else:
+                    frames = list(range(start, end + 1))
+
+                tag = ('_' + safe_name(action.name)) if use_tag else ''
+                for number, frame in enumerate(frames, 1):
+                    scene.frame_set(frame)
+                    for objects, stem in series:
+                        name = '%s%s_%05d' % (stem, tag, number)
+                        path = os.path.join(base_dir, name + '.lwo')
+                        data = builder.build(objects, name)
+                        self._write_file(path, data)
+                        written.append((path, 'frame %d, %s' % (frame, builder.summary())))
+        finally:
+            for ptr, (ident, had, action, slot) in saved.items():
+                ad = ident.animation_data
+                if not had:
+                    if ad is not None:
+                        ident.animation_data_clear()
+                elif ad is not None:
+                    want = 'KEY' if isinstance(ident, bpy.types.Key) else 'OBJECT'
+                    assign_action(ad, action, want, slot)
+            scene.frame_set(saved_frame)
+
+        if not written:
+            raise RuntimeError('No frames written: no chosen Action drives the selected objects')
+        return written
+
 
 # =============================================================================
 # Registration
@@ -1079,14 +1445,24 @@ def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_idtech_lwo.bl_idname, text="idTech 4 LWO (.lwo)")
 
 
+classes = (
+    LWOActionItem,
+    LWO_UL_ActionsList,
+    EXPORT_OT_idtech_lwo_select_actions,
+    EXPORT_OT_idtech_lwo,
+)
+
+
 def register():
-    bpy.utils.register_class(EXPORT_OT_idtech_lwo)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-    bpy.utils.unregister_class(EXPORT_OT_idtech_lwo)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
 
 
 if __name__ == "__main__":
